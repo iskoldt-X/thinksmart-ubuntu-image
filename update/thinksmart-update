@@ -1,0 +1,600 @@
+#!/usr/bin/python3
+"""thinksmart-update: checks for and installs releases of the voice client (runs as root).
+
+  thinksmart-update check            fetch the release manifest, note a newer version
+  thinksmart-update run              handle the requests the page dropped in requests/ (check, install)
+  thinksmart-update install VERSION  install the checked version (what a page request ends in)
+  thinksmart-update boot             finish or undo an install a power cut interrupted (check, run
+                                     and install do this first too: an install killed mid-way)
+  thinksmart-update adopt DIR [VER]  take an existing client checkout as the installed version
+
+Nothing is installed without a user's tap: the timer only checks. The page (client, user ubuntu)
+and the welcome page (kiosk, ubuntu) only read status.json and drop a request file; this script
+installs only the version it fetched itself, whatever the request says.
+
+No signatures (decided 2026-11-01, no key to keep): releases come only over HTTPS (plain http only
+from this machine, for a test server), and every file must match the size and sha256 the manifest
+names, so a broken or truncated download is never installed.
+
+Layout: /opt/thinksmart/client/<version>/ (root-owned, .venv -> ../../envs/<id>), current and
+previous symlinks; /opt/thinksmart/envs/<id>/ Python environments named by the hash of the
+release's requirements.lock. User data (~/.config/thinksmart-client, the hub's data/, the kiosk
+conf, Wi-Fi) lives elsewhere and is never touched.
+
+Release layout under each source URL (GitHub Releases or a test server, same paths):
+  latest/download/latest.json                                    manifest
+  download/client-v1.2.3/thinksmart-client-1.2.3.tar.gz          paths named in the manifest
+"""
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CONF = Path('/etc/thinksmart-update.conf')
+STATE = Path('/var/lib/thinksmart-update')
+STATUS = STATE / 'status.json'
+REQUESTS = STATE / 'requests'
+DOWNLOAD = STATE / 'download'
+PENDING = STATE / 'pending.json'       # a switch that hasn't passed its self-test yet
+LOCK = Path('/run/thinksmart-update.lock')
+OPT = Path('/opt/thinksmart')
+CLIENT = OPT / 'client'
+ENVS = OPT / 'envs'
+UNIT = 'thinksmart-client.service'
+UNIT_FILE = Path('/etc/systemd/system') / UNIT
+HEALTH = 'http://127.0.0.1:8090/api/health'
+TEST_SECONDS = 90          # a new version must answer the health check within this
+BOOT_TEST_SECONDS = 240    # after a reboot the hub and audio take longer to come up
+HUB_FRESH = 30             # the client asks the hub every 10 s; older than this = not reachable
+SPARE = 50 << 20           # keep this much free on the root partition after an install
+
+LOCAL_HOSTS = ('127.0.0.1', 'localhost', '::1')   # plain http allowed only for these (test sources)
+VERSION_RE = re.compile(r'\d{1,4}\.\d{1,4}\.\d{1,4}')   # also a directory name under CLIENT
+ENV_ID_RE = re.compile(r'[0-9a-f]{16}')                    # a directory name under ENVS
+
+ACTIVE_JOBS = ('preparing', 'downloading', 'installing', 'testing', 'rolling_back')
+
+
+class Fail(Exception):
+    """An error to show on the page as it is (Chinese, for the user)."""
+
+
+def log(*args):
+    print(*args, flush=True)
+
+
+# ---- configuration and status ----
+
+def read_conf():
+    conf = {'SOURCES': '', 'PROXY': '', 'REQUEST_GROUP': 'ubuntu'}
+    try:
+        for line in CONF.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, v = line.split('=', 1)
+                conf[k.strip()] = v.strip().strip('"\'')
+    except OSError:
+        pass
+    return conf
+
+
+def load_status():
+    try:
+        return json.loads(STATUS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_status(st):
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = STATUS.with_suffix('.tmp')
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+    tmp.chmod(0o644)
+    tmp.replace(STATUS)
+
+
+def set_job(st, state, version, message='', progress=None):
+    st['job'] = {'state': state, 'version': version, 'message': message, 'progress': progress,
+                 'time': int(time.time())}
+    save_status(st)
+    log(f'[{state}] {version} {message}')
+
+
+def version_key(v):
+    try:
+        return tuple(int(x) for x in v.split('.'))
+    except (AttributeError, ValueError):
+        return (-1,)
+
+
+def current_version():
+    try:
+        return os.readlink(CLIENT / 'current')
+    except OSError:
+        return None
+
+
+def previous_version():
+    try:
+        return os.readlink(CLIENT / 'previous')
+    except OSError:
+        return None
+
+
+# ---- network ----
+
+def allowed_url(url):
+    u = urllib.parse.urlsplit(url)
+    return u.scheme == 'https' or (u.scheme == 'http' and u.hostname in LOCAL_HOSTS)
+
+
+class HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """GitHub redirects release downloads to its file host; never follow one to plain http."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not allowed_url(newurl):
+            raise urllib.error.URLError(f'refusing redirect to {newurl}')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def opener(conf):
+    handlers = [HttpsOnlyRedirects()]
+    if conf['PROXY']:
+        handlers.append(urllib.request.ProxyHandler({'http': conf['PROXY'], 'https': conf['PROXY']}))
+    return urllib.request.build_opener(*handlers)
+
+
+def fetch(conf, url, limit):
+    req = urllib.request.Request(url, headers={'User-Agent': 'thinksmart-update'})
+    with opener(conf).open(req, timeout=20) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise Fail('更新服务器返回的内容太大')
+    return data
+
+
+def fetch_manifest(conf, st):
+    """The newest valid manifest from the first source that answers; Fail otherwise."""
+    sources = conf['SOURCES'].split()
+    if not sources:
+        raise Fail('没有配置更新地址')
+    errors = []
+    for src in sources:
+        if not allowed_url(src):
+            errors.append(f'{src}: not https')
+            continue
+        try:
+            m = json.loads(fetch(conf, src + 'latest/download/latest.json', 64 << 10))
+        except (OSError, urllib.error.URLError, Fail, ValueError) as e:
+            errors.append(f'{src}: {e}')
+            continue
+        if not valid_manifest(m):
+            errors.append(f'{src}: not a client manifest')
+            continue
+        # a replayed old manifest (to keep the device on a vulnerable version) is refused
+        seen = st.get('published')
+        if seen and _when(m.get('published')) < _when(seen):
+            errors.append(f'{src}: manifest older than one seen before')
+            continue
+        st['published'] = m.get('published')
+        m['_source'] = src
+        return m
+    log('manifest:', '; '.join(errors))
+    if all(e.endswith(': not https') for e in errors):
+        raise Fail('更新地址必须是 https')
+    if any(e.endswith(': not a client manifest') for e in errors):
+        raise Fail('更新服务器上的版本信息不对，已忽略')
+    raise Fail('连不上更新服务器')
+
+
+def valid_manifest(m):
+    """Shape check: the version and environment id become directory names, sizes and hashes are
+    what each download is checked against."""
+    try:
+        files = m['files']
+        ok = (m.get('component') == 'client' and VERSION_RE.fullmatch(m['version'])
+              and ENV_ID_RE.fullmatch(files['env']['id'])
+              and isinstance(m.get('notes', []), list))
+        for item in (files['code'], files['env']):
+            ok = ok and (isinstance(item['path'], str) and '..' not in item['path']
+                         and not item['path'].startswith('/')
+                         and isinstance(item['size'], int) and item['size'] > 0
+                         and re.fullmatch(r'[0-9a-f]{64}', item['sha256']))
+        return bool(ok)
+    except (KeyError, TypeError):
+        return False
+
+
+def _when(s):
+    try:
+        return datetime.datetime.fromisoformat(s).timestamp()
+    except (TypeError, ValueError):
+        return 0
+
+
+def env_present(env_id):
+    return (ENVS / env_id / 'bin' / 'python').exists()
+
+
+def download_size(m):
+    f = m['files']
+    return f['code']['size'] + (0 if env_present(f['env']['id']) else f['env']['size'])
+
+
+def download(conf, m, item, st, version, done_before, total):
+    """Download one file of the release into DOWNLOAD, checking size and sha256 as it streams."""
+    DOWNLOAD.mkdir(parents=True, exist_ok=True)
+    dest = DOWNLOAD / Path(item['path']).name
+    sources = [m['_source']] + [s for s in conf['SOURCES'].split() if s != m['_source'] and allowed_url(s)]
+    last_error = None
+    for src in sources:
+        h, got, shown = hashlib.sha256(), 0, 0
+        try:
+            req = urllib.request.Request(src + 'download/' + item['path'],
+                                         headers={'User-Agent': 'thinksmart-update'})
+            with opener(conf).open(req, timeout=30) as r, open(dest, 'wb') as f:
+                while True:
+                    chunk = r.read(64 << 10)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    if got > item['size']:
+                        raise Fail('下载的文件比清单里写的大')
+                    h.update(chunk)
+                    f.write(chunk)
+                    if time.monotonic() - shown > 1:
+                        shown = time.monotonic()
+                        set_job(st, 'downloading', version, '正在下载', (done_before + got) / total)
+        except (OSError, urllib.error.URLError) as e:
+            last_error = e
+            log(f'download {src}: {e}')
+            continue
+        except Fail:
+            dest.unlink(missing_ok=True)
+            raise
+        if got != item['size'] or h.hexdigest() != item['sha256']:
+            dest.unlink(missing_ok=True)
+            raise Fail('下载的文件校验不对（可能被改过或没下完整），没有安装')
+        return dest
+    raise Fail(f'下载失败：{last_error}')
+
+
+# ---- install ----
+
+def extract(tgz, dest, data_filter):
+    """Unpack into dest (created fresh). 'data' refuses absolute paths, '..', links out of dest and
+    device files; environments use 'tar' because their bin/python links to /usr/bin/python3."""
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    with tarfile.open(tgz) as t:
+        t.extractall(dest, filter='data' if data_filter else 'tar')
+
+
+def link_env(release_dir, env_id):
+    venv = release_dir / '.venv'
+    if venv.is_symlink() or venv.exists():
+        venv.unlink() if venv.is_symlink() else shutil.rmtree(venv)
+    venv.symlink_to(Path('..') / '..' / 'envs' / env_id)
+    # the client can't write .pyc next to root-owned code: compile now so it doesn't on every start
+    subprocess.run([str(release_dir / '.venv' / 'bin' / 'python'), '-m', 'compileall', '-q',
+                    str(release_dir / 'thinksmart_client')], check=False)
+
+
+def set_link(name, version):
+    tmp = CLIENT / f'.{name}.tmp'
+    tmp.unlink(missing_ok=True)
+    if version is None:
+        (CLIENT / name).unlink(missing_ok=True)
+        return
+    tmp.symlink_to(version)
+    os.replace(tmp, CLIENT / name)    # atomic: a power cut leaves the old or the new link
+
+
+def sync_unit(version):
+    """A release may change its service file (deploy/thinksmart-client.service): use the one of the
+    version that is about to run."""
+    src = CLIENT / version / 'deploy' / UNIT
+    if src.exists() and (not UNIT_FILE.exists() or src.read_bytes() != UNIT_FILE.read_bytes()):
+        shutil.copyfile(src, UNIT_FILE)
+        subprocess.run(['systemctl', 'daemon-reload'], check=False)
+
+
+def restart_client(version):
+    sync_unit(version)
+    subprocess.run(['systemctl', 'restart', UNIT], check=False)
+
+
+def health():
+    try:
+        with urllib.request.urlopen(HEALTH, timeout=3) as r:
+            return json.loads(r.read())
+    except (OSError, ValueError):
+        return None
+
+
+def self_test(version, need_hub, seconds):
+    """(True, '') once the client reports this version with audio (and the hub, if it was reachable
+    before the update); (False, why) after `seconds`."""
+    end = time.monotonic() + seconds
+    h = None
+    while time.monotonic() < end:
+        time.sleep(3)
+        h = health()
+        if not h or h.get('version') != version:
+            continue
+        if h.get('audio') and (h.get('hub') or not need_hub):
+            # still up a few seconds later (not crashing right after the first answer)?
+            time.sleep(5)
+            h2 = health()
+            if h2 and h2.get('version') == version:
+                return True, ''
+    if not h:
+        return False, f'新版本 {seconds} 秒内没有启动起来'
+    if h.get('version') != version:
+        return False, '新版本没有启动起来'
+    if not h.get('audio'):
+        return False, '新版本打不开麦克风或扬声器'
+    return False, '新版本连不上小智网关'
+
+
+def cleanup():
+    keep = {current_version(), previous_version()} - {None}
+    envs = set()
+    for d in CLIENT.iterdir():
+        if d.is_symlink() or not d.is_dir():
+            continue
+        if d.name in keep:
+            try:
+                envs.add(os.readlink(d / '.venv').rsplit('/', 1)[-1])
+            except OSError:
+                pass
+        else:
+            shutil.rmtree(d, ignore_errors=True)
+    for d in ENVS.iterdir():
+        if d.name not in envs:
+            shutil.rmtree(d, ignore_errors=True)
+    shutil.rmtree(DOWNLOAD, ignore_errors=True)
+
+
+def install(conf, version):
+    st = load_status()
+    cur = current_version()
+    try:
+        set_job(st, 'preparing', version, '正在准备')
+        m = fetch_manifest(conf, st)       # again: something newer may have been published since
+        if m['version'] != version:
+            note_available(st, m, cur)
+            raise Fail(f'更新服务器上的版本已经变成 {m["version"]}，请重新点更新')
+        if cur and version_key(version) <= version_key(cur):
+            raise Fail(f'{version} 不比现在的 {cur} 新')
+        files = m['files']
+        total = download_size(m)
+        if shutil.disk_usage(OPT).free < total * 4 + SPARE:   # download + unpacked (~3x)
+            raise Fail('存储空间不够，没有安装')
+        before = health()
+        need_hub = bool(before and before.get('hub'))
+
+        set_job(st, 'downloading', version, '正在下载', 0)
+        code = download(conf, m, files['code'], st, version, 0, total)
+        env_id = files['env']['id']
+        env_tgz = None
+        if not env_present(env_id):
+            env_tgz = download(conf, m, files['env'], st, version, files['code']['size'], total)
+
+        set_job(st, 'installing', version, '正在安装')
+        new_dir = CLIENT / f'{version}.new'
+        extract(code, new_dir, True)
+        if env_tgz:
+            extract(env_tgz, ENVS / f'{env_id}.new', False)
+            os.replace(ENVS / f'{env_id}.new', ENVS / env_id)
+        link_env(new_dir, env_id)
+        if (CLIENT / version).exists():           # left over from a failed try
+            shutil.rmtree(CLIENT / version)
+        os.replace(new_dir, CLIENT / version)
+    except Fail as e:
+        set_job(st, 'failed', version, str(e))
+        return 1
+    except Exception as e:  # noqa: BLE001 - anything else still has to reach the page
+        log('install failed:', repr(e))
+        set_job(st, 'failed', version, f'安装出错：{e}')
+        return 1
+
+    pending = {'from': cur, 'to': version, 'previous': previous_version(), 'need_hub': need_hub}
+    PENDING.write_text(json.dumps(pending))
+    set_link('previous', cur)
+    set_link('current', version)
+    set_job(st, 'testing', version, '正在重启并自检')
+    restart_client(version)
+    return finish(conf, st, pending, TEST_SECONDS)
+
+
+def finish(conf, st, pending, seconds):
+    """Self-test the switched-to version; keep it or switch back."""
+    version, old = pending['to'], pending['from']
+    ok, why = self_test(version, pending['need_hub'], seconds)
+    if ok:
+        PENDING.unlink(missing_ok=True)
+        st['current'] = version
+        st['available'] = None
+        st.pop('failed', None)
+        set_job(st, 'done', version, f'已更新到 {version}')
+        cleanup()
+        return 0
+    log('self-test failed:', why)
+    if not old:
+        set_job(st, 'failed', version, why + '，也没有可以退回的版本')
+        return 1
+    set_job(st, 'rolling_back', version, why + f'，正在退回 {old}')
+    set_link('current', old)
+    set_link('previous', pending.get('previous'))
+    restart_client(old)
+    PENDING.unlink(missing_ok=True)
+    st['current'] = old
+    st['failed'] = version
+    ok_old, _ = self_test(old, False, seconds)
+    shutil.rmtree(CLIENT / version, ignore_errors=True)
+    cleanup()
+    msg = f'{version} 自检没通过（{why}），已退回 {old}'
+    if not ok_old:
+        msg += '，但退回后客户端也没正常启动，请重启设备'
+    set_job(st, 'rolled_back', version, msg)
+    return 1
+
+
+# ---- check, requests, boot ----
+
+def note_available(st, m, cur):
+    if cur is None or version_key(m['version']) > version_key(cur):
+        st['available'] = {'version': m['version'], 'notes': m.get('notes', []),
+                           'published': m.get('published'), 'size': download_size(m)}
+    else:
+        st['available'] = None
+
+
+def check(conf):
+    st = load_status()
+    st['current'] = current_version()
+    st['checked'] = int(time.time())
+    try:
+        m = fetch_manifest(conf, st)
+        note_available(st, m, st['current'])
+        st['check_error'] = None
+    except Fail as e:
+        st['check_error'] = str(e)
+    except Exception as e:  # noqa: BLE001
+        log('check failed:', repr(e))
+        st['check_error'] = '检查更新出错'
+    save_status(st)
+    log('check:', st.get('available'), st.get('check_error'))
+    return 0
+
+
+def run(conf):
+    """Requests from the page: files in requests/, each {"action": "check"|"install", "version": ...}."""
+    actions = {}
+    for f in sorted(REQUESTS.glob('*')):
+        if f.name.startswith('.'):        # .install.tmp: still being written
+            continue
+        try:
+            if f.stat().st_size < 1024:
+                body = json.loads(f.read_text())
+                actions[body.get('action')] = str(body.get('version', ''))
+        except (OSError, ValueError, AttributeError):
+            pass
+        f.unlink(missing_ok=True)
+    if 'install' in actions:
+        st = load_status()
+        avail = st.get('available') or {}
+        # only what we checked ourselves; the request can't name an arbitrary version
+        if avail.get('version') and avail['version'] == actions['install']:
+            return install(conf, avail['version'])
+        log('install request ignored:', actions['install'], avail)
+        return check(conf)
+    if 'check' in actions:
+        return check(conf)
+    return 0
+
+
+def recover(conf, seconds, why):
+    """Finish or undo an update whose process is gone. Runs holding the lock, so no update is
+    running: a job still in an active state was cut off (power cut, reboot, systemd's timeout, a
+    crash) and the page would show it as running, update button hidden, until this clears it."""
+    for d in list(CLIENT.glob('*.new')) + list(ENVS.glob('*.new')):
+        shutil.rmtree(d, ignore_errors=True)
+    st = load_status()
+    try:
+        pending = json.loads(PENDING.read_text())
+    except (OSError, ValueError):
+        pending = None
+    if pending:
+        if current_version() == pending['to']:
+            log('recover: an update was interrupted during its self-test, testing again')
+            set_job(st, 'testing', pending['to'], '上次更新被中断，正在重新自检')
+            return finish(conf, st, pending, seconds)
+        PENDING.unlink(missing_ok=True)
+    job = st.get('job') or {}
+    if job.get('state') in ACTIVE_JOBS:
+        set_job(st, 'failed', job.get('version'), f'上次更新被中断（{why}），没有改动')
+    return 0
+
+
+def boot(conf):
+    return recover(conf, BOOT_TEST_SECONDS, '断电或重启')
+
+
+def adopt(src, version=None):
+    """Install a client checkout (with its .venv) as a version, e.g. the one the image ships."""
+    src = Path(src).resolve()
+    if version is None:
+        for line in (src / 'thinksmart_client' / '__init__.py').read_text().splitlines():
+            if line.startswith('__version__'):
+                version = line.split('=', 1)[1].strip().strip('\'"')
+    if not version:
+        sys.exit('no version given and none in thinksmart_client/__init__.py')
+    lock = src / 'requirements.lock'
+    env_id = hashlib.sha256(lock.read_bytes()).hexdigest()[:16] if lock.exists() else 'adopted'
+    CLIENT.mkdir(parents=True, exist_ok=True)
+    ENVS.mkdir(parents=True, exist_ok=True)
+    if not env_present(env_id):
+        venv = (src / '.venv').resolve()
+        subprocess.run(['cp', '-a', str(venv), str(ENVS / f'{env_id}.new')], check=True)
+        subprocess.run(['chown', '-R', 'root:root', str(ENVS / f'{env_id}.new')], check=True)
+        os.replace(ENVS / f'{env_id}.new', ENVS / env_id)
+    dest = CLIENT / version
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest, symlinks=True,
+                    ignore=shutil.ignore_patterns('.venv', '__pycache__', '.git'))
+    subprocess.run(['chown', '-R', 'root:root', str(dest)], check=True)
+    subprocess.run(['chmod', '-R', 'go-w', str(dest)], check=True)
+    link_env(dest, env_id)
+    set_link('current', version)
+    st = load_status()
+    st['current'] = version
+    save_status(st)
+    sync_unit(version)
+    log(f'adopted {src} as {version} (env {env_id})')
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    conf = read_conf()
+    cmd = sys.argv[1]
+    STATE.mkdir(parents=True, exist_ok=True)
+    REQUESTS.mkdir(exist_ok=True)
+    shutil.chown(REQUESTS, 'root', conf['REQUEST_GROUP'])
+    REQUESTS.chmod(0o770)
+    # one at a time: the daily check waits while an install runs
+    with open(LOCK, 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if cmd in ('check', 'run', 'install'):
+            recover(conf, TEST_SECONDS, '下载太慢超时或出错')
+        if cmd == 'check':
+            return check(conf)
+        if cmd == 'run':
+            return run(conf)
+        if cmd == 'install' and len(sys.argv) == 3:
+            return install(conf, sys.argv[2])
+        if cmd == 'boot':
+            return boot(conf)
+        if cmd == 'adopt' and len(sys.argv) in (3, 4):
+            return adopt(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else None)
+    sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
