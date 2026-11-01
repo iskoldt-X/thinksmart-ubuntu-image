@@ -77,7 +77,7 @@ An AI agent can't do these. At these points tell the owner exactly what to do an
 
 - plug and unplug the USB cable and the power cable, try another cable or another USB port on the computer;
 - the button combination for EDL mode (unplug the power cable → connect the USB cable → hold Volume + and Volume − → plug in the power cable → release the volume buttons after 3–5 seconds; see 1.1);
-- powering off and on: the device has **no power button**; unplugging the power cable turns it off, plugging it in turns it on. If the system is running and you can log in, run `sudo poweroff` first, then unplug; if you can't log in, just unplug;
+- powering off and on: the device has **no power button**; plugging in the power cable turns it on. While the system is running, shut it down before unplugging: tap 「关机」 (Shut down) at the bottom of the voice interface's settings, or run `sudo systemctl halt` over SSH, and unplug 10 seconds after the screen goes black (the system takes a few more seconds to finish). Wait about 30 seconds before plugging it back in; plugged straight back in, it may not power on. The 「关机」 button comes with client 0.1.2; the image ships 0.1.0, so update it first under 「软件更新」 (Software update) in the settings. Don't use `sudo poweroff`: with the cable in, the device powers straight back on. Only unplug without shutting down when you can't (emergency mode, the lk2nd screen);
 - look at the device screen and tell you what it shows (black, lk2nd screen, welcome page, voice interface…);
 - pick the Wi-Fi network and type its password on the device's touchscreen;
 - open the hub admin page in a browser, set the admin password, enter the API key;
@@ -269,7 +269,7 @@ The `.img` is the content of the whole `system` partition and holds two small pa
 
 The device has no power button: plugging in the power cable turns it on, unplugging it cuts the power.
 
-1. Unplug the power cable. If the system is running and you can log in, run `sudo poweroff` first and unplug once the screen is black. If the USB cable is plugged in, unplug it too.
+1. Unplug the power cable. If the system is running, shut it down first (「关机」 in the settings or `sudo systemctl halt`) and unplug 10 seconds after the screen goes black. If the USB cable is plugged in, unplug it too. Then wait 30 seconds before the next steps; plugged straight back in after a shutdown, it may not power on and won't enter EDL.
 2. Connect the device to the computer with the USB cable.
 3. **Hold Volume + and Volume − together** and keep holding.
 4. While holding them, plug in the power cable.
@@ -466,7 +466,7 @@ If it fails: if the script reports an error, **don't power off and don't retry**
 
 ### A7. Enter EDL again and check the new partition table
 
-Wait until the screen is black, enter EDL as in [1.1](#11-enter-edl-owner-does-this), then:
+Wait until the screen goes black (with the cable in it may light up again by itself; that's fine), then unplug the power and enter EDL as in [1.1](#11-enter-edl-owner-does-this), then:
 
 ```bash
 edl printgpt 2>&1 | tee gpt-after.txt
@@ -741,6 +741,38 @@ ssh: connect to host <DEVICE_IP> port 22: No route to host
 ```
 
 The device is online and the IP is right, but the Mac can't reach LAN addresses: most likely the terminal app lacks the "Local Network" permission. Open "System Settings → Privacy & Security → Local Network", turn it on for the terminal app you use (Terminal, iTerm, VS Code…), then reopen the terminal and try again. If the browser can't open `http://<DEVICE_IP>:16688/admin`, it may be the same cause; turn the permission on for the browser.
+
+### 3.9 Boot stops in emergency mode
+
+What you see: a screen of text ending with `You are in emergency mode`, with `Failed to start systemd-fsck…` and `Dependency failed for boot.mount - /boot` above it, and further up `I/O error, dev mmcblk0 … (WRITE)`.
+
+Why: the power was pulled without shutting down, the next boot had to repair the boot partition `/boot`, and writing the repair failed. Your data is on another partition (root) and is normally fine. Shutting down before unplugging (see [Things the owner must do by hand](#things-the-owner-must-do-by-hand)) avoids it.
+
+Fix (rewrites only the boot partition, your data stays):
+
+1. Enter EDL as in 1.1.
+2. Read the whole `system` partition out first as a backup (about 6.8 GB; about 4 minutes here, up to 15 or so on a slower computer; don't touch the cable meanwhile):
+
+   ```bash
+   edl r system system-backup.img
+   ```
+
+3. Take the boot partition out of the image of **the version you flashed** (it starts at sector 2048 and is 509952 sectors long):
+
+   ```bash
+   dd if=thinksmart-ubuntu-<date>.img of=boot-part.img bs=512 skip=2048 count=509952
+   ```
+
+   On Windows run it in WSL.
+4. Work out where to write it: the Offset of `system` in `edl printgpt` (for example `0x000000001c300000`) divided by 512, plus 2048. On a device whose partition table was changed as in this guide that is `923648 + 2048 = 925696`.
+5. Write it (**ask the user first**) and restart:
+
+   ```bash
+   edl ws 925696 boot-part.img
+   edl reset
+   ```
+
+   It should come up in the voice interface. If it still stops in emergency mode, keep a photo of the screen and `system-backup.img`, reflash with route B and restore your data as in 4.2 (without an earlier backup, the data can be recovered from `system-backup.img`).
 
 ---
 
