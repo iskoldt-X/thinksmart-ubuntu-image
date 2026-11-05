@@ -130,20 +130,17 @@
   .form { display: grid; gap: 14px; margin-bottom: 16px; }
   .field { display: flex; align-items: center; gap: 12px; height: 68px; padding: 0 20px; border-radius: 16px;
            background: #ffffff0d; border: 2px solid transparent; font-size: 24px; }
-  .field.focus { border-color: var(--accent); background: #6c8cff14; }
+  .field:focus-within { border-color: var(--accent); background: #6c8cff14; }
   .field .label { width: 92px; flex: none; font-size: 17px; color: var(--ink3); }
-  .field .val { flex: 0 1 auto; min-width: 0; overflow: hidden; white-space: pre; letter-spacing: .5px; }
-  .field .eye { margin-left: auto; }
-  .field .val.ph { color: var(--ink3); font-size: 18px; letter-spacing: 0; }
-  .field .caret { display: none; width: 2px; height: 30px; background: var(--accent2); animation: blink 1s steps(1) infinite; }
-  .field.focus .caret { display: block; }
-  @keyframes blink { 50% { opacity: 0; } }
+  .field input { flex: 1; min-width: 0; height: 100%; border: 0; outline: 0; background: transparent; color: var(--ink);
+                 font: inherit; letter-spacing: .5px; caret-color: var(--accent2);
+                 user-select: text; -webkit-user-select: text; }
+  .field input::placeholder { color: var(--ink3); font-size: 18px; letter-spacing: 0; }
   .eye { height: 44px; padding: 0 14px; border-radius: 10px; border: 0; background: #ffffff12; font-size: 15px; color: var(--ink2); }
   .hint { font-size: 17px; color: var(--ink3); margin: -4px 0 2px; }
   .msg { min-height: 26px; font-size: 18px; color: var(--ink2); display: flex; align-items: center; gap: 10px; }
   .msg.bad { color: var(--bad); } .msg.ok { color: var(--ok); }
   .spinner { width: 20px; height: 20px; border-radius: 50%; border: 3px solid #ffffff22; border-top-color: var(--accent2); animation: spin .8s linear infinite; }
-  .kbwrap { margin-top: auto; }
   .actions { display: flex; gap: 14px; margin-top: 6px; }
   .primary { height: 56px; min-width: 200px; padding: 0 28px; border: 0; border-radius: 14px; font-size: 19px; font-weight: 700;
              color: #0b1020; background: linear-gradient(135deg, var(--accent), var(--accent2)); }
@@ -241,18 +238,20 @@
     </div>
     <div class="form">
       <div class="hint" id="joinHint"></div>
-      <div class="field" id="fieldSsid"><span class="label">网络名称</span><span class="val"></span><span class="caret"></span></div>
-      <div class="field" id="fieldPw"><span class="label">密码</span><span class="val"></span><span class="caret"></span>
-        <button class="eye" id="btnEye">显示</button></div>
+      <label class="field" id="fieldSsid"><span class="label">网络名称</span>
+        <input id="inSsid" type="text" placeholder="输入网络名称" enterkeyhint="next" autocomplete="off" spellcheck="false"></label>
+      <label class="field" id="fieldPw"><span class="label">密码</span>
+        <input id="inPw" type="password" data-kb-enter="连接" autocomplete="off" spellcheck="false">
+        <button class="eye" id="btnEye" type="button">显示</button></label>
       <div class="msg" id="joinMsg"></div>
       <div class="actions"><button class="primary" id="btnJoin">连接</button>
         <button class="link" id="btnForget">忘记这个网络</button></div>
     </div>
-    <div class="kbwrap" id="kb"></div>
   </section>
 </div>
 
 <script src="qrcode.js"></script>
+<!-- the kiosk injects the system keyboard into every page; this copy is for previewing in a desktop browser -->
 <script src="keyboard.js"></script>
 <script>
 const $ = id => document.getElementById(id);
@@ -349,7 +348,7 @@ const REASONS = {
   notfound: '找不到这个网络，可能离得太远或名称有误',
   timeout: '连接超时，请靠近路由器后再试',
 };
-let nets = [], target = null, fields = { ssid: '', pw: '' }, focus = 'pw', showPw = false, busy = false, kb = null;
+let nets = [], target = null, fields = { ssid: '', pw: '' }, showPw = false, busy = false;
 
 function openSheet() {
   $('sheet').classList.add('open');
@@ -358,6 +357,7 @@ function openSheet() {
   scan();
 }
 function closeSheet() {
+  if (document.activeElement) document.activeElement.blur();
   $('sheet').classList.remove('open');
   call('busy', { value: false });
 }
@@ -412,18 +412,18 @@ function join(net, hidden) {
     : target.mode === 'info' ? '已连接 · ' + quality
     : target.mode === 'saved' ? '已保存的网络 · ' + quality + '，点「连接」用保存的密码连接'
     : (target.secure ? '加密网络 · ' + quality + '，输入密码后点「连接」' : '开放网络 · ' + quality);
-  focus = hidden ? 'ssid' : 'pw';
   setMsg('');
   showPane('paneJoin');
-  if (!kb) kb = ThinkSmartKeyboard.create($('kb'), {
-    enterLabel: '连接',
-    onKey: ch => { if (!busy) { fields[focus] += ch; renderFields(); } },
-    onBackspace: () => { if (!busy) { fields[focus] = fields[focus].slice(0, -1); renderFields(); } },
-    onEnter: connect,
-  });
-  kb.reset();
   renderFields();
   if (target.mode === 'type' && !target.secure && !hidden) connect();  // open network: nothing to type
+  else focusField();
+}
+
+// the system keyboard comes up with the focused field
+function focusField() {
+  if (!typing() || busy) return;
+  const el = target.hidden && !fields.ssid ? $('inSsid') : target.secure ? $('inPw') : $('inSsid');
+  setTimeout(() => el.focus(), 0);
 }
 
 function typing() { return target.mode === 'type'; }
@@ -435,25 +435,18 @@ function canConnect() {
 }
 
 function renderFields() {
-  const pwText = showPw ? fields.pw : '•'.repeat(fields.pw.length);
-  const set = (el, text, ph) => {
-    const v = el.querySelector('.val');
-    v.textContent = text || ph;
-    v.classList.toggle('ph', !text);
-  };
-  set($('fieldSsid'), fields.ssid, '输入网络名称');
-  set($('fieldPw'), pwText, target.secure ? '至少 8 位' : '');
-  $('fieldSsid').classList.toggle('focus', focus === 'ssid');
-  $('fieldPw').classList.toggle('focus', focus === 'pw');
+  if ($('inSsid').value !== fields.ssid) $('inSsid').value = fields.ssid;
+  if ($('inPw').value !== fields.pw) $('inPw').value = fields.pw;
+  $('inPw').type = showPw ? 'text' : 'password';
+  $('inPw').placeholder = target.hidden ? '没有密码就留空' : '至少 8 位';
+  $('inSsid').disabled = $('inPw').disabled = busy;
   $('btnEye').textContent = showPw ? '隐藏' : '显示';
   // fields and keyboard only while typing; forgetting only for a network that has a saved profile
   $('fieldSsid').style.display = typing() && target.hidden ? '' : 'none';
   $('fieldPw').style.display = typing() && target.secure ? '' : 'none';
-  $('kb').style.display = typing() ? '' : 'none';
   $('btnForget').style.display = target.saved || target.mode === 'info' ? '' : 'none';
   $('btnJoin').style.display = target.mode === 'saved' ? '' : 'none';
   $('btnJoin').disabled = $('btnForget').disabled = busy;
-  if (kb) kb.setEnterEnabled(canConnect());
 }
 
 function setMsg(text, kind) {
@@ -485,11 +478,11 @@ async function connect() {
   }
   // Whatever went wrong, let the user type a password next
   if (target.secure) target.mode = 'type';
-  focus = target.hidden ? 'ssid' : 'pw';
   if (r.reason === 'password') fields.pw = '';
   setMsg(usingSaved && r.reason === 'password' ? '保存的密码已失效，请重新输入'
     : REASONS[r.reason] || ('连接失败' + (r.detail ? '：' + r.detail : '')), 'bad');
   renderFields();
+  focusField();
 }
 
 // Stages reported by thinksmart-kiosk.py while it joins (from wpa_supplicant's state)
@@ -578,8 +571,19 @@ $('btnForget').addEventListener('click', forget);
 $('btnJoin').addEventListener('click', connect);
 $('btnBack').addEventListener('click', () => { if (!busy) showList(); });
 $('btnEye').addEventListener('click', e => { e.stopPropagation(); showPw = !showPw; renderFields(); });
-$('fieldSsid').addEventListener('click', () => { focus = 'ssid'; renderFields(); });
-$('fieldPw').addEventListener('click', () => { focus = 'pw'; renderFields(); });
+$('btnEye').addEventListener('pointerdown', e => e.preventDefault());  // keep the field (and keyboard)
+$('inSsid').addEventListener('input', () => { fields.ssid = $('inSsid').value; });
+$('inPw').addEventListener('input', () => { fields.pw = $('inPw').value; });
+$('inSsid').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();  // keep the keyboard up: on to the password
+  if (target.secure) $('inPw').focus();
+});
+$('inPw').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  if (!canConnect()) { e.preventDefault(); return; }  // keep typing
+  connect();
+});
 
 tick();
 setInterval(tick, 1000);

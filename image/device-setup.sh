@@ -1,7 +1,8 @@
 #!/bin/sh
 # Turn a running ThinkSmart (the old Plasma-based image plus our services) into the release layout.
 # Run on the device as root from a copy of this repository:
-#   sudo sh image/device-setup.sh files            system-layer files from this tree (kiosk, screen, mic, zram)
+#   sudo sh image/device-setup.sh files            system-layer files from this tree (kiosk, screen, mic, zram,
+#                                                  Bluetooth speaker)
 #   sudo sh image/device-setup.sh update CLIENT    updater; CLIENT (a client tree with .venv) becomes
 #                                                  /opt/thinksmart/client/<version>
 #   sudo sh image/device-setup.sh kiosk            boot into the kiosk through thinksmart-kiosk.service, not SDDM
@@ -45,6 +46,10 @@ files() {
     install -m 644 -o $U -g $U xiaozhi/99-cd18781y-alsa.lua $H/.config/wireplumber/main.lua.d/
     install -d /etc/wireplumber/main.lua.d
     install -m 644 xiaozhi/99-cd18781y-alsa.lua /etc/wireplumber/main.lua.d/
+    # Bluetooth speaker: phones stream to the device, the voice client mixes it in (bluetooth/)
+    install -d /etc/wireplumber/bluetooth.lua.d
+    install -m 644 bluetooth/60-thinksmart-speaker.lua /etc/wireplumber/bluetooth.lua.d/
+    sh bluetooth/setup-bluez.sh
     # No core dumps (a crashing browser filled the disk); services this device has no use for
     install -d /etc/systemd/coredump.conf.d
     install -m 644 kiosk/coredump-off.conf /etc/systemd/coredump.conf.d/90-thinksmart-kiosk.conf
@@ -99,7 +104,7 @@ PURGE="sddm sddm-theme-* plasma-* kwin-* kwin-common libkwin* kglobalacceld kio-
  libqt5* qt5-* libllvm18 libclang1-18 libclang-cpp18 modemmanager"
 # Kept on purpose even if the purge would orphan them
 KEEP="weston gir1.2-webkit2-4.1 libwebkit2gtk-4.1-0 gir1.2-gtk-3.0 python3-gi
- pipewire pipewire-pulse wireplumber libspa-0.2-modules pulseaudio-utils alsa-utils
+ pipewire pipewire-pulse wireplumber libspa-0.2-modules libspa-0.2-bluetooth pulseaudio-utils alsa-utils
  libegl-mesa0 libgbm1 libgl1-mesa-dri libglx-mesa0 mesa-libgallium mesa-va-drivers mesa-vdpau-drivers mesa-vulkan-drivers
  fonts-noto-cjk fonts-noto-core fonts-noto-ui-core fonts-noto-mono fonts-noto-color-emoji fonts-dejavu-core fonts-dejavu-mono
  locales tzdata network-manager wpasupplicant bluez openssh-server sudo git curl ffmpeg
