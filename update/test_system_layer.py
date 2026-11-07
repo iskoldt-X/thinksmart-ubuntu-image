@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from test_thinksmart_update import SCRIPT, load_module, tu, install_dirs  # noqa: F401  (fixture)
+from test_thinksmart_update import SCRIPT, load_module, tu, install_dirs, source  # noqa: F401  (fixtures)
 
 REPO = SCRIPT.parent.parent
 
@@ -333,7 +333,8 @@ def test_make_release_carries_the_system_layer(tmp_path):
     """make-release.py --system: one manifest with both, the updater bundled for old devices, and a
     VERSION that didn't move with changed files stops it."""
     img = tmp_path / 'img'
-    subprocess.run(['git', 'clone', '-q', str(REPO), str(img)], check=True)
+    # without the repository's own system-v* tags: this test makes its own
+    subprocess.run(['git', 'clone', '-q', '--no-tags', str(REPO), str(img)], check=True)
     # this branch's uncommitted work as it would be committed
     for f in subprocess.run(['git', '-C', str(REPO), 'ls-files', '-mo', '--exclude-standard'],
                             capture_output=True, text=True, check=True).stdout.split():
@@ -380,3 +381,67 @@ def test_make_release_carries_the_system_layer(tmp_path):
     (img / 'kiosk' / 'welcome.html').write_text('changed again')
     r = subprocess.run(mk, capture_output=True, text=True)
     assert r.returncode != 0 and 'uncommitted' in r.stderr
+
+
+# ---- power cuts: what recovery reads must be on disk before files change (review 11-07) ----
+
+
+def test_backup_and_pending_are_on_disk_before_any_file_changes(sysu, release, monkeypatch):
+    old_device(sysu)
+    release()
+    sysu.run_main('check')
+    events = []
+    monkeypatch.setattr(sysu.os, 'sync', lambda: events.append('sync'))
+    real_put = sysu.put_file
+
+    def put_file(*a):
+        # by now the pending record and the whole backup must have been synced, in full
+        events.append(('put', sysu.SYS_PENDING.stat().st_size,
+                       (sysu.SYS_BACKUP / 'index.json').stat().st_size))
+        return real_put(*a)
+    sysu.put_file = put_file
+    assert sysu.install_system(sysu.read_conf(), '0.2.0') == 0
+    first_put = next(i for i, e in enumerate(events) if e != 'sync')
+    assert 'sync' in events[:first_put]
+    _, pending_size, index_size = events[first_put]
+    assert pending_size > 0 and index_size > 0
+    # the record is synced before the pending record is dropped
+    assert json.loads(sysu.SYS_RECORD.read_text())['version'] == '0.2.0'
+    assert events[-1] == 'sync'
+
+
+def test_a_damaged_backup_copy_is_not_restored(sysu, release):
+    """Power cut while the backup was still in the page cache: the copy came back empty. Restoring
+    it would leave an empty kiosk.py; leaving the new file is the lesser harm."""
+    old_device(sysu)
+    mainconf = sysu.target('/etc/bluetooth/main.conf')
+    release(tree_kw={'post': f'echo "JustWorksRepairing = always" >> {mainconf}\n'})
+    sysu.run_main('check')
+    index_of = {}
+
+    def fail_after_damaging(actions, need_hub, seconds):
+        if len(sysu.effects) == 1:
+            index = json.loads((sysu.SYS_BACKUP / 'index.json').read_text())
+            i = next(n for n, it in enumerate(index) if it['dest'] == '/usr/local/bin/thinksmart-kiosk.py')
+            index_of['kiosk'] = i
+            (sysu.SYS_BACKUP / 'files' / str(i)).write_bytes(b'')
+            return False, '屏幕界面没有启动起来'
+        return True, ''
+    sysu.system_self_test = fail_after_damaging
+    assert sysu.install_system(sysu.read_conf(), '0.2.0') == 1
+    assert sysu.target('/usr/local/bin/thinksmart-kiosk.py').read_bytes() == b'kiosk v2\n'   # not emptied
+    assert mainconf.read_bytes() == b'[General]\n'                                          # the rest is back
+    assert not sysu.target('/usr/local/share/thinksmart-kiosk/welcome.html').exists()
+    assert sysu.load_status()['job']['state'] == 'rolled_back'
+
+
+def test_client_switch_waits_for_its_files_on_disk(tu, source, monkeypatch):
+    tu.run_main('check')
+    events = []
+    monkeypatch.setattr(tu.os, 'sync', lambda: events.append('sync'))
+    real = tu.set_link
+    tu.set_link = lambda name, v: (events.append((name, tu.PENDING.exists() and tu.PENDING.stat().st_size)),
+                                   real(name, v))[1]
+    assert tu.run_main('install', '1.2.0') == 0
+    switch = events.index(next(e for e in events if e != 'sync' and e[0] == 'current'))
+    assert 'sync' in events[:switch] and events[switch][1] > 0
