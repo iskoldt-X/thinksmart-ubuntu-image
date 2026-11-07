@@ -564,7 +564,12 @@ function renderUpdate() {
     }
   } else {
     title = job.state === 'done' ? '更新完成' : '更新没有完成';
-    text = job.message || '';
+    // the state the update left, both versions: one tap installs the system layer then the client,
+    // and an older updater keeps only the last one's message
+    text = job.state === 'done' && u.current && sys.current
+      ? `现在是 系统层 ${sys.current} · 客户端 ${u.current}`
+        + (/重启设备后生效/.test(job.message || '') ? '，部分改动重启设备后生效' : '')
+      : job.message || '';
     bad = job.state !== 'done';
   }
   $('updTitle').textContent = title || '';
