@@ -11,8 +11,8 @@
   string (target, ip, usb, host, ssid, help) and later through window.thinksmartStatus({...}).
   Wi-Fi is set up on screen: the page asks thinksmart-kiosk.py to scan and connect through
   the "thinksmart" message handler and gets answers in window.thinksmartReply({...}).
-  A client update found by thinksmart-update (status polled through the same handler) is shown
-  under the status line with an 更新 button; the install itself runs as root in the updater.
+  An update found by thinksmart-update (client and/or system layer; status polled through the same
+  handler) is shown under the status line with an 更新 button; the install runs as root in the updater.
   Everything is local: no network needed to render this page.
 -->
 <style>
@@ -61,7 +61,7 @@
   .cta { display: none; margin-left: 10px; flex: none; padding: 12px 20px; border: 0; border-radius: 12px; font-size: 17px; font-weight: 600;
          color: #0b1020; background: linear-gradient(135deg, var(--accent), var(--accent2)); }
   .status.offline .cta { display: block; }
-  /* client update (thinksmart-update): shown when a new version was found or one is being installed */
+  /* update (thinksmart-update): shown when a new version was found or one is being installed */
   .upd { display: none; margin-top: 16px; max-width: 640px; padding: 16px 20px; border-radius: 16px;
          border: 1px solid #7fa0ff88; background: linear-gradient(150deg, #6c8cff22, #5ee0ff0a); }
   .upd.on { display: block; }
@@ -74,6 +74,7 @@
   .upd .cta[hidden] { display: none; }
   .upd ul { margin: 10px 0 0; padding-left: 22px; font-size: 16px; line-height: 1.6; color: var(--ink2); }
   .upd ul:empty { display: none; }
+  .upd ul li.h { list-style: none; margin: 6px 0 0 -22px; font-weight: 700; color: var(--ink); }
 
   .cards { display: grid; gap: 18px; }
   .card { padding: 22px 24px; border-radius: 22px; background: var(--card); border: 1px solid var(--line); }
@@ -337,7 +338,8 @@ function mock(m) {
   else if (m.cmd === 'update_status') {
     const kind = new URLSearchParams(location.search).get('upd');
     reply({ ok: !!kind, update: kind && { current: '0.1.0', available: { version: '0.2.0', notes: ['聊天页的光球加了表情', '修好了睡眠时段跨午夜时不生效'] },
-            job: kind === 'busy' ? { state: 'testing', version: '0.2.0', time: Date.now() / 1000 } : null } }, 0);
+            system: { current: '0.2.0', available: kind === 'both' ? { version: '0.3.0', notes: ['设置页能切换 WiFi'], missing: [] } : null },
+            job: kind === 'busy' ? { state: 'testing', version: '0.3.0', time: Date.now() / 1000, component: 'system' } : null } }, 0);
   }
   else reply({ ok: true }, 0);
 }
@@ -512,25 +514,45 @@ async function forget() {
   setTimeout(() => { if (!busy) { showList(); scan(); } }, 1400);
 }
 
-/* ---- client update: the root updater installs, this page only shows and asks (via thinksmart-kiosk.py) ---- */
+/* ---- updates (client and system layer): the root updater installs, this page only shows and asks (via thinksmart-kiosk.py) ---- */
 const UPD_STAGE = { preparing: '正在准备', downloading: '正在下载', installing: '正在安装',
-                    testing: '正在重启客户端并自检', rolling_back: '自检没通过，正在退回' };
+                    testing: '正在重启并自检', rolling_back: '自检没通过，正在退回' };
 let upd = null, updArmed = 0;
+let updStarting = 0;   // request sent, the updater hasn't reported yet (it takes a few seconds to start)
+function updParts(u) {
+  // what one tap installs, in the updater's order: the system layer first
+  const parts = [], sa = (u.system || {}).available;
+  if (sa && !(sa.missing || []).length) parts.push({ key: 'system', name: '系统层', ...sa });
+  if (u.available) parts.push({ key: 'client', name: '客户端', ...u.available });
+  return parts;
+}
 function renderUpdate() {
-  const u = upd || {}, job = u.job || {}, avail = u.available;
+  const u = upd || {}, job = u.job || {}, sys = u.system || {}, parts = updParts(u);
   const busy = job.state in UPD_STAGE;
+  // between the confirming tap and the updater's first report: don't show 更新 again (looks like
+  // the tap missed); ends when the updater reports or after 30 s of silence
+  if (updStarting && (busy || (job.time || 0) * 1000 > updStarting - 2000 || Date.now() - updStarting > 30000)) updStarting = 0;
+  const starting = !!updStarting;
   const recent = !!job.time && Date.now() / 1000 - job.time < 3600;
   const result = !busy && recent && job.message;
-  $('upd').classList.toggle('on', !!(avail || busy || result));
+  $('upd').classList.toggle('on', !!(parts.length || busy || result || starting));
   let title, text, bad = false;
-  if (busy) {
-    title = `正在更新到 ${job.version}`;
+  if (starting) {
+    title = '正在开始更新…';
+    text = '正在连接更新服务器，请稍等';
+  } else if (busy) {
+    title = `正在更新${job.component === 'system' ? '系统层' : '客户端'} ${job.version}`;
     const pct = job.state === 'downloading' && job.progress != null ? ` ${Math.round(job.progress * 100)}%` : '';
     text = `${UPD_STAGE[job.state]}${pct}，请不要断电`;
-  } else if (avail) {
-    title = `有新版本 ${avail.version}`;
+  } else if (parts.length) {
+    title = '有新版本 ' + parts.map(p => `${p.name} ${p.version}`).join(' · ');
     bad = !!result && job.state !== 'done';
-    text = bad ? job.message : (u.current ? `当前版本 ${u.current}` : '小智客户端');
+    text = bad ? job.message : (u.current ? `当前：客户端 ${u.current}` + (sys.current ? ` · 系统层 ${sys.current}` : '') : '小智客户端');
+    if (Date.now() - updArmed < 5000) {
+      // waiting for the confirming tap: keep the hint (the status poll re-renders every 3 s)
+      bad = false;
+      text = `更新时${parts.some(p => p.key === 'system') ? '屏幕会闪一下、' : ''}客户端会重启（约 ${parts.length > 1 ? 2 : 1} 分钟），再点一下「确认更新」开始`;
+    }
   } else {
     title = job.state === 'done' ? '更新完成' : '更新没有完成';
     text = job.message || '';
@@ -539,8 +561,10 @@ function renderUpdate() {
   $('updTitle').textContent = title || '';
   $('updSub').textContent = text || '';
   $('updSub').classList.toggle('bad', !!bad);
-  $('updNotes').innerHTML = avail && !busy ? (avail.notes || []).map(n => `<li>${esc(n)}</li>`).join('') : '';
-  $('updBtn').hidden = !avail || busy;
+  $('updNotes').innerHTML = parts.length && !busy && !starting
+    ? parts.map(p => (parts.length > 1 ? `<li class="h">${p.name} ${esc(p.version)}</li>` : '')
+                     + (p.notes || []).map(n => `<li>${esc(n)}</li>`).join('')).join('') : '';
+  $('updBtn').hidden = !parts.length || busy || starting;
   $('updBtn').textContent = Date.now() - updArmed < 5000 ? '确认更新' : '更新';
 }
 async function pollUpdate() {
@@ -549,16 +573,20 @@ async function pollUpdate() {
   renderUpdate();
 }
 $('updBtn').addEventListener('click', async () => {
-  if (!upd || !upd.available) return;
+  const parts = updParts(upd || {});
+  if (!parts.length) return;
+  const sys = parts.find(p => p.key === 'system'), cli = parts.find(p => p.key === 'client');
   if (Date.now() - updArmed > 5000) {
     updArmed = Date.now();
-    $('updSub').textContent = '更新时客户端会重启（约 1 分钟），再点一下「确认更新」开始';
-    $('updBtn').textContent = '确认更新';
+    renderUpdate();
     return setTimeout(renderUpdate, 5100);
   }
   updArmed = 0;
-  const r = await call('update_install', { version: upd.available.version });
-  if (!r.ok) { $('updSub').textContent = '没能开始更新'; $('updSub').classList.add('bad'); }
+  updStarting = Date.now();
+  renderUpdate();
+  setTimeout(renderUpdate, 30100);
+  const r = await call('update_install', { version: cli ? cli.version : '', system: sys ? sys.version : '' });
+  if (!r.ok) { updStarting = 0; renderUpdate(); $('updSub').textContent = '没能开始更新'; $('updSub').classList.add('bad'); }
   else pollUpdate();
 });
 

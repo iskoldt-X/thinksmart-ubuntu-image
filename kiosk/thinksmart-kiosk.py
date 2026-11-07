@@ -275,12 +275,14 @@ def update_status(_msg, _progress):
 
 
 def update_request(msg, _progress):
-    """Ask the updater to install the version the user tapped (it installs only what it checked)."""
+    """Ask the updater to install the versions the user tapped: the client's and/or the system
+    layer's (it installs only what it checked itself)."""
     action = 'install' if msg.get('cmd') == 'update_install' else 'check'
     try:
         tmp = os.path.join(UPDATE_STATE, 'requests', f'.{action}.tmp')
         with open(tmp, 'w') as f:
-            json.dump({'action': action, 'version': str(msg.get('version', ''))}, f)
+            json.dump({'action': action, 'version': str(msg.get('version') or ''),
+                       'system': str(msg.get('system') or '')}, f)
         os.replace(tmp, os.path.join(UPDATE_STATE, 'requests', action))
         return {'ok': True}
     except OSError:
