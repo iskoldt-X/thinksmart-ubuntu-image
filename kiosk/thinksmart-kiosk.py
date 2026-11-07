@@ -256,10 +256,11 @@ def wifi_connect(msg, progress):
 
 def wifi_forget(msg, _progress):
     ssid = str(msg.get('ssid') or '')
+    ok = True
     for name, uuid in wifi_profiles().items():
         if name == ssid:
-            nmcli('connection', 'delete', 'uuid', uuid)
-    return {'ok': True}
+            ok = nmcli('connection', 'delete', 'uuid', uuid).returncode == 0 and ok
+    return {'ok': ok}
 
 
 UPDATE_STATE = '/var/lib/thinksmart-update'

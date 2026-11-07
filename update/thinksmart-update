@@ -966,6 +966,7 @@ def install_system(conf, version):
         return system_rollback(st, pending, f'没装成功（{why}）', TEST_SECONDS)
     write_record(version, tree, entries)
     SYS_PENDING.unlink(missing_ok=True)
+    os.sync()
     shutil.rmtree(tree, ignore_errors=True)
     shutil.rmtree(DOWNLOAD, ignore_errors=True)
     sysst = st.setdefault('system', {})
@@ -1094,6 +1095,20 @@ def recover(conf, seconds, why):
     except (OSError, ValueError):
         spending = None
     shutil.rmtree(SYSTEM / 'new', ignore_errors=True)
+    if spending and system_record().get('version') == spending['to']:
+        # it passed its self-test and was recorded; only dropping the pending record didn't reach
+        # the disk. Rolling back now would run the old files under the new version's record.
+        log('recover: system layer', spending['to'], 'was already installed, keeping it')
+        SYS_PENDING.unlink(missing_ok=True)
+        os.sync()
+        sysst = st.setdefault('system', {})
+        sysst.update(current=spending['to'], available=None)
+        sysst.pop('failed', None)
+        if (st.get('job') or {}).get('state') in ACTIVE_JOBS:
+            set_job(st, 'done', spending['to'], f'系统层已更新到 {spending["to"]}', component='system')
+        else:
+            save_status(st)
+        spending = None
     if spending:
         # half-applied files or an untested switch: the backup is what last worked
         log('recover: a system layer install was interrupted, putting the backup back')
@@ -1111,7 +1126,8 @@ def recover(conf, seconds, why):
         PENDING.unlink(missing_ok=True)
     job = st.get('job') or {}
     if job.get('state') in ACTIVE_JOBS:
-        set_job(st, 'failed', job.get('version'), f'上次更新被中断（{why}），没有改动')
+        set_job(st, 'failed', job.get('version'), f'上次更新被中断（{why}），没有改动',
+                component=job.get('component', 'client'))
     return 0
 
 

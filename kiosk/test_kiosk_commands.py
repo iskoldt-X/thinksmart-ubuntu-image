@@ -43,3 +43,13 @@ def test_other_pages_get_nothing():
         ('http://127.0.0.1:8090/', ''),                       # no URL configured
     ]:
         assert kiosk.page_commands(uri, url) == {}, uri
+
+
+def test_forget_reports_whether_nmcli_deleted_it(monkeypatch):
+    # the pages say 已忘记 only on ok: a failed delete must not answer ok
+    monkeypatch.setattr(kiosk, 'wifi_profiles', lambda: {'Home': 'u1', 'Other': 'u2'})
+    calls = []
+    for code, ok in ((0, True), (10, False)):
+        monkeypatch.setattr(kiosk, 'nmcli', lambda *a, code=code, **k: (calls.append(a), types.SimpleNamespace(returncode=code))[1])
+        assert kiosk.wifi_forget({'ssid': 'Home'}, None) == {'ok': ok}
+    assert calls == [('connection', 'delete', 'uuid', 'u1')] * 2

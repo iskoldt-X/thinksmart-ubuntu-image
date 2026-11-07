@@ -445,3 +445,39 @@ def test_client_switch_waits_for_its_files_on_disk(tu, source, monkeypatch):
     assert tu.run_main('install', '1.2.0') == 0
     switch = events.index(next(e for e in events if e != 'sync' and e[0] == 'current'))
     assert 'sync' in events[:switch] and events[switch][1] > 0
+
+
+def test_power_cut_after_a_passed_install_keeps_it(sysu, release, monkeypatch):
+    """Installed, self-tested and recorded; the power went before dropping the pending record
+    reached the disk. Boot must keep the new layer, not put the old files back under the new
+    version's record."""
+    old_device(sysu)
+    release()
+    sysu.run_main('check')
+    real_unlink = Path.unlink
+
+    def unlink(self, *a, **k):
+        if self == sysu.SYS_PENDING:
+            raise KeyboardInterrupt          # dies right here
+        return real_unlink(self, *a, **k)
+    monkeypatch.setattr(Path, 'unlink', unlink)
+    with pytest.raises(KeyboardInterrupt):
+        sysu.install_system(sysu.read_conf(), '0.2.0')
+    monkeypatch.setattr(Path, 'unlink', real_unlink)
+    assert sysu.SYS_PENDING.exists() and sysu.system_record()['version'] == '0.2.0'
+    after = device_files(sysu)
+    sysu.run_main('boot')
+    st = sysu.load_status()
+    assert st['job']['state'] == 'done' and st['job']['component'] == 'system'
+    assert st['system']['current'] == '0.2.0'
+    assert device_files(sysu) == after and not sysu.SYS_PENDING.exists()
+    assert sysu.system_verify() == 0
+    assert len(sysu.effects) == 1                  # no rollback restarts
+
+
+def test_an_interrupted_system_job_stays_a_system_job(sysu):
+    sysu.save_status({'job': {'state': 'downloading', 'version': '0.2.0', 'component': 'system',
+                              'message': '', 'progress': 0.3, 'time': 0}})
+    sysu.run_main('boot')
+    job = sysu.load_status()['job']
+    assert job['state'] == 'failed' and job['component'] == 'system' and '中断' in job['message']

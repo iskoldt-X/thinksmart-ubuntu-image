@@ -505,8 +505,12 @@ async function forget() {
   const ssid = target.ssid;
   setMsg(`正在忘记 ${ssid}…`, 'wait');
   renderFields();
-  await call('forget', { ssid });
+  const r = await call('forget', { ssid });
   busy = false;
+  if (!r.ok) {
+    setMsg(`没能忘记 ${ssid}，请再试一次`, 'bad');
+    return renderFields();
+  }
   target.saved = false;
   setMsg(`已忘记 ${ssid}，下次连接需要重新输入密码`, 'ok');
   renderFields();
