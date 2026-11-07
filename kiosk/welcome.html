@@ -607,8 +607,10 @@ $('btnHidden').addEventListener('click', () => join(null, true));
 $('btnForget').addEventListener('click', forget);
 $('btnJoin').addEventListener('click', connect);
 $('btnBack').addEventListener('click', () => { if (!busy) showList(); });
-$('btnEye').addEventListener('click', e => { e.stopPropagation(); showPw = !showPw; renderFields(); });
-$('btnEye').addEventListener('pointerdown', e => e.preventDefault());  // keep the field (and keyboard)
+// On pointerdown, not click: cancelling a touch's pointerdown (to keep the field focused and the system
+// keyboard up) makes WebKitGTK send no click at all, so a click handler never ran on the device's screen
+// (a mouse in a desktop browser still clicks). The on-screen keyboard's keys work the same way.
+$('btnEye').addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); showPw = !showPw; renderFields(); });
 $('inSsid').addEventListener('input', () => { fields.ssid = $('inSsid').value; });
 $('inPw').addEventListener('input', () => { fields.pw = $('inPw').value; });
 $('inSsid').addEventListener('keydown', e => {
