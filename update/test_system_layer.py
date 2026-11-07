@@ -46,7 +46,7 @@ def sysu(tu, tmp_path, monkeypatch):
     m.pkg_installed = lambda name: name != 'not-installed-pkg'
     m.effects = []
     m.take_effect = lambda actions: m.effects.append(list(actions))
-    m.system_self_test = lambda actions, need_hub, seconds: (True, '')
+    m.system_self_test = lambda actions, need_hub, seconds, need_audio=True: (True, '')
     m.health = lambda: None
     return m
 
@@ -227,7 +227,7 @@ def test_failed_self_test_puts_every_file_back(sysu, release, tmp_path):
     mode = sysu.target('/usr/local/bin/thinksmart-kiosk.py').stat().st_mode
     sysu.run_main('check')
     # the new files fail, the old ones (after the rollback restarted everything again) pass
-    sysu.system_self_test = lambda actions, need_hub, seconds: (len(sysu.effects) > 1, '屏幕界面没有启动起来')
+    sysu.system_self_test = lambda actions, need_hub, seconds, need_audio=True: (len(sysu.effects) > 1, '屏幕界面没有启动起来')
     assert sysu.install_system(sysu.read_conf(), '0.2.0') == 1
     st = sysu.load_status()
     assert st['job']['state'] == 'rolled_back' and st['job']['component'] == 'system'
@@ -419,7 +419,7 @@ def test_a_damaged_backup_copy_is_not_restored(sysu, release):
     sysu.run_main('check')
     index_of = {}
 
-    def fail_after_damaging(actions, need_hub, seconds):
+    def fail_after_damaging(actions, need_hub, seconds, need_audio=True):
         if len(sysu.effects) == 1:
             index = json.loads((sysu.SYS_BACKUP / 'index.json').read_text())
             i = next(n for n, it in enumerate(index) if it['dest'] == '/usr/local/bin/thinksmart-kiosk.py')
@@ -481,3 +481,24 @@ def test_an_interrupted_system_job_stays_a_system_job(sysu):
     sysu.run_main('boot')
     job = sysu.load_status()['job']
     assert job['state'] == 'failed' and job['component'] == 'system' and '中断' in job['message']
+
+
+def test_sound_counts_only_if_it_worked_before(sysu, monkeypatch):
+    """Client crashed (the welcome page shows): an update touching audio must not be rolled back
+    for the sound the client couldn't give before either, or the client fix behind it never lands."""
+    monkeypatch.setattr(sysu, 'health', lambda: None)
+    assert sysu.system_checks(['wireplumber'], False, need_audio=True) == {'audio': None}
+    assert sysu.system_checks(['wireplumber'], False, need_audio=False) == {}
+    monkeypatch.setattr(sysu, 'health', lambda: {'audio': True, 'hub': True})
+    assert sysu.system_checks(['mic'], True, need_audio=True) == {'audio': True}
+
+
+def test_install_remembers_whether_sound_worked(sysu, release):
+    old_device(sysu)
+    release()
+    sysu.run_main('check')
+    seen = []
+    sysu.health = lambda: None                      # the client is down before the update
+    sysu.system_self_test = lambda actions, need_hub, seconds, need_audio=True: (seen.append(need_audio), (True, ''))[1]
+    assert sysu.install_system(sysu.read_conf(), '0.2.0') == 0
+    assert seen == [False]

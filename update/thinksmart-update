@@ -45,6 +45,7 @@ import datetime
 import fcntl
 import grp
 import hashlib
+import http.client
 import json
 import os
 import pwd
@@ -226,7 +227,7 @@ def fetch_manifest(conf, st):
             continue
         try:
             m = json.loads(fetch(conf, src + 'latest/download/latest.json', 64 << 10))
-        except (OSError, urllib.error.URLError, Fail, ValueError) as e:
+        except (OSError, urllib.error.URLError, http.client.HTTPException, Fail, ValueError) as e:
             errors.append(f'{src}: {e}')
             continue
         if not valid_manifest(m):
@@ -307,7 +308,8 @@ def download(conf, m, item, st, version, done_before, total):
                         shown = time.monotonic()
                         set_job(st, 'downloading', version, '正在下载', (done_before + got) / total,
                                 (st.get('job') or {}).get('component', 'client'))
-        except (OSError, urllib.error.URLError) as e:
+        # a connection cut half way raises http.client.IncompleteRead, not an OSError
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as e:
             last_error = e
             log(f'download {src}: {e}')
             continue
@@ -318,7 +320,8 @@ def download(conf, m, item, st, version, done_before, total):
             dest.unlink(missing_ok=True)
             raise Fail('下载的文件校验不对（可能被改过或没下完整），没有安装')
         return dest
-    raise Fail(f'下载失败：{last_error}')
+    log('download failed everywhere:', repr(last_error))
+    raise Fail('下载失败：网络断了或者更新服务器没有响应，请稍后再试')
 
 
 # ---- install ----
@@ -802,7 +805,7 @@ def kiosk_pid():
     return out.strip() or None
 
 
-def system_checks(actions, need_hub):
+def system_checks(actions, need_hub, need_audio=True):
     """{check name: value or None}; None = not passing. Equal values twice, 10 s apart = stable."""
     out = {}
     for a in actions:
@@ -816,7 +819,10 @@ def system_checks(actions, need_hub):
     if 'kiosk' in actions:
         active, _ = unit_state('system', 'thinksmart-kiosk.service')
         out['kiosk'] = kiosk_pid() if active else None
-    if {'pipewire', 'wireplumber', 'mic'} & set(actions):
+    # sound only counts if it worked before the update (like the hub): a client that had crashed, the
+    # page on the welcome screen, would otherwise fail every update that touches audio, and with it
+    # the client update that would fix it
+    if need_audio and {'pipewire', 'wireplumber', 'mic'} & set(actions):
         h = health()
         out['audio'] = bool(h and h.get('audio') and (h.get('hub') or not need_hub)) or None
     if 'updater' in actions:
@@ -829,15 +835,15 @@ SYS_CHECK_WHY = {'kiosk': '屏幕界面没有启动起来', 'audio': '麦克风�
                  'updater': '新的更新服务启动不了', 'bluetooth': '蓝牙服务没有启动起来'}
 
 
-def system_self_test(actions, need_hub, seconds):
+def system_self_test(actions, need_hub, seconds, need_audio=True):
     end = time.monotonic() + seconds
     first = {}
     while time.monotonic() < end:
         time.sleep(3)
-        first = system_checks(actions, need_hub)
+        first = system_checks(actions, need_hub, need_audio)
         if all(v is not None for v in first.values()):
             time.sleep(10)      # still up, not restarted in between?
-            again = system_checks(actions, need_hub)
+            again = system_checks(actions, need_hub, need_audio)
             if again == first:
                 return True, ''
     bad = [k for k, v in first.items() if v is None] or list(first)
@@ -894,7 +900,8 @@ def system_rollback(st, pending, why, seconds):
     sysst = st.setdefault('system', {})
     sysst['current'] = system_version()
     sysst['failed'] = version
-    ok, _ = system_self_test([a for a in actions if a != 'updater'], False, seconds)
+    ok, _ = system_self_test([a for a in actions if a != 'updater'], False, seconds,
+                             pending.get('need_audio', True))
     shutil.rmtree(SYSTEM / 'new', ignore_errors=True)
     shutil.rmtree(DOWNLOAD, ignore_errors=True)
     msg = f'系统层 {version} {why}，已退回 {old}'
@@ -924,6 +931,7 @@ def install_system(conf, version):
             raise Fail('存储空间不够，没有安装')
         before = health()
         need_hub = bool(before and before.get('hub'))
+        need_audio = bool(before and before.get('audio'))
         set_job(st, 'downloading', version, '正在下载', 0, component='system')
         pkg = download(conf, m, s['file'], st, version, 0, s['file']['size'])
         set_job(st, 'installing', version, '正在安装', component='system')
@@ -945,7 +953,7 @@ def install_system(conf, version):
         return 1
 
     # from here on files change: a power cut or an error puts the backup back
-    pending = {'from': cur, 'to': version, 'need_hub': need_hub, 'actions': sorted(
+    pending = {'from': cur, 'to': version, 'need_hub': need_hub, 'need_audio': need_audio, 'actions': sorted(
         {a for e in entries for a in e[4] if a not in ('keep', 'none')} | {'reload'})}
     write_durable(SYS_PENDING, json.dumps(pending))
     try:
@@ -955,7 +963,7 @@ def install_system(conf, version):
         write_durable(SYS_PENDING, json.dumps(pending))
         set_job(st, 'testing', version, '正在重启相关服务并自检', component='system')
         take_effect(actions)
-        ok, why = system_self_test(actions, need_hub, TEST_SECONDS)
+        ok, why = system_self_test(actions, need_hub, TEST_SECONDS, need_audio)
     except Fail as e:
         ok, why = False, str(e)
     except Exception as e:  # noqa: BLE001

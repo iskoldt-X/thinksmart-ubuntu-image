@@ -307,10 +307,14 @@ window.thinksmartStatus = function (st) {
 const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.thinksmart;
 let seq = 0;
 const pending = {};
+// The shell answers every command (a connect takes at most ~60 s); one that never answers (an
+// older shell when nmcli hangs) would keep the page busy for good: after this it counts as failed
+const CALL_TIMEOUT = 90000;
 function call(cmd, args) {
   return new Promise(resolve => {
     const id = ++seq;
     pending[id] = resolve;
+    setTimeout(() => window.thinksmartReply({ id, ok: false, reason: 'noreply' }), CALL_TIMEOUT);
     const msg = Object.assign({ id, cmd }, args || {});
     if (bridge) bridge.postMessage(JSON.stringify(msg));
     else mock(msg);
@@ -349,6 +353,7 @@ const REASONS = {
   password: '密码不对，请再试一次',
   notfound: '找不到这个网络，可能离得太远或名称有误',
   timeout: '连接超时，请靠近路由器后再试',
+  noreply: '设备没有回应，请过一会儿再看看网络状态',
 };
 let nets = [], target = null, fields = { ssid: '', pw: '' }, showPw = false, busy = false;
 

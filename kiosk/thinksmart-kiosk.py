@@ -20,6 +20,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -290,6 +291,20 @@ def update_request(msg, _progress):
         return {'ok': False}
 
 
+def run_command(handler, msg, progress):
+    """A page's command, always with an answer: a page waiting on one that never comes stays busy
+    (the Wi-Fi panel can't be closed). nmcli hanging past its timeout, NetworkManager restarting,
+    anything else: {ok: false} with a reason the pages know."""
+    try:
+        r = handler(msg, progress)
+        return r if isinstance(r, dict) else {'ok': False, 'reason': 'failed'}
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'reason': 'timeout'}
+    except Exception as e:  # noqa: BLE001 - the page still needs its answer
+        print(f'thinksmart-kiosk: {msg.get("cmd")} failed: {e!r}', file=sys.stderr, flush=True)
+        return {'ok': False, 'reason': 'failed', 'detail': str(e)[:120]}
+
+
 LOOPBACK = ('127.0.0.1', 'localhost', '::1')
 WIFI_COMMANDS = {'wifi_status': wifi_status, 'scan': wifi_scan, 'connect': wifi_connect, 'forget': wifi_forget}
 WELCOME_COMMANDS = dict(WIFI_COMMANDS, update_status=update_status, update_install=update_request,
@@ -413,7 +428,7 @@ def main():
             GLib.idle_add(run_js, 'thinksmartProgress', {'id': msg.get('id'), 'stage': stage})
 
         def work():
-            r = handler(msg, progress)
+            r = run_command(handler, msg, progress)
             r['id'] = msg.get('id')
             # the address and Wi-Fi name may have just changed (not after the update polls: every 3 s)
             st = None if str(msg.get('cmd', '')).startswith('update_') else page_status()

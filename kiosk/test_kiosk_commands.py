@@ -53,3 +53,16 @@ def test_forget_reports_whether_nmcli_deleted_it(monkeypatch):
         monkeypatch.setattr(kiosk, 'nmcli', lambda *a, code=code, **k: (calls.append(a), types.SimpleNamespace(returncode=code))[1])
         assert kiosk.wifi_forget({'ssid': 'Home'}, None) == {'ok': ok}
     assert calls == [('connection', 'delete', 'uuid', 'u1')] * 2
+
+
+def test_a_command_that_raises_still_answers():
+    # the page waits for an answer: without one the Wi-Fi panel stays busy until a restart
+    def hangs(msg, progress):
+        raise kiosk.subprocess.TimeoutExpired(['nmcli'], 10)
+
+    def breaks(msg, progress):
+        raise RuntimeError('NetworkManager went away')
+    assert kiosk.run_command(hangs, {'cmd': 'connect'}, None) == {'ok': False, 'reason': 'timeout'}
+    r = kiosk.run_command(breaks, {'cmd': 'forget'}, None)
+    assert r['ok'] is False and r['reason'] == 'failed'
+    assert kiosk.run_command(lambda m, p: {'ok': True}, {'cmd': 'scan'}, None) == {'ok': True}
