@@ -502,3 +502,19 @@ def test_install_remembers_whether_sound_worked(sysu, release):
     sysu.system_self_test = lambda actions, need_hub, seconds, need_audio=True: (seen.append(need_audio), (True, ''))[1]
     assert sysu.install_system(sysu.read_conf(), '0.2.0') == 0
     assert seen == [False]
+
+
+def test_one_tap_for_both_reports_both(sysu, release):
+    """The pages show the last job's message: after system layer + client it must name both."""
+    release(client='1.2.0')
+    sysu.run_main('check')
+    sysu.install_system = lambda conf, v: (sysu.set_job(sysu.load_status(), 'done', v, f'系统层已更新到 {v}',
+                                                        component='system'), 0)[1]
+    sysu.install = lambda conf, v: (sysu.set_job(sysu.load_status(), 'done', v, f'已更新到 {v}'), 0)[1]
+    (sysu.REQUESTS / 'install').write_text(json.dumps({'action': 'install', 'version': '1.2.0', 'system': '0.2.0'}))
+    assert sysu.run_main('run') == 0
+    assert sysu.load_status()['job']['message'] == '已更新到 系统层 0.2.0 · 客户端 1.2.0'
+    # one of them alone: the message stays its own
+    (sysu.REQUESTS / 'install').write_text(json.dumps({'action': 'install', 'version': '1.2.0'}))
+    sysu.run_main('run')
+    assert sysu.load_status()['job']['message'] == '已更新到 1.2.0'

@@ -1083,7 +1083,16 @@ def run(conf):
                 rc = install_system(conf, system_v)
                 if rc or not client_v:
                     return rc          # a failed system layer stops here: the client waits
-            return install(conf, client_v)
+            rc = install(conf, client_v)
+            if rc == 0 and system_v:
+                # both went in with one tap: say so in the one result the pages show (the client's
+                # own 已更新到 would hide the system layer's)
+                st = load_status()
+                msg = f'已更新到 系统层 {system_v} · 客户端 {client_v}'
+                if (st.get('system') or {}).get('reboot'):
+                    msg += '，部分改动重启设备后生效'
+                set_job(st, 'done', client_v, msg)
+            return rc
         log('install request ignored:', body, avail, savail)
         return check(conf)
     if 'check' in actions:
